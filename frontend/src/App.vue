@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { readDbVersion } from './utils/db';
+import { onSync } from './utils/crossTab';
+import { useClockStore } from './stores/clockStore';
+import { usePartStore } from './stores/partStore';
+import { useStepStore } from './stores/stepStore';
+import { useSnapshotStore } from './stores/snapshotStore';
 
 const route = useRoute();
 const router = useRouter();
@@ -15,6 +20,13 @@ const activeMenu = computed(() => {
 });
 
 const version = readDbVersion();
+
+// 其他标签页写入后重载全部 store：工序回退/调序/零件变更在本地立即重算
+onMounted(() => {
+  onSync(() => {
+    void Promise.all([useClockStore().load(), usePartStore().load(), useStepStore().load(), useSnapshotStore().load()]);
+  });
+});
 
 function onSelect(index: string) {
   if (index === '/tests') {

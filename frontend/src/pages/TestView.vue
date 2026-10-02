@@ -4,15 +4,19 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useClockStore } from '../stores/clockStore';
 import { useStepStore } from '../stores/stepStore';
+import { useSnapshotStore } from '../stores/snapshotStore';
 import RateChart from '../components/common/RateChart.vue';
 import StateBadge from '../components/common/StateBadge.vue';
-import { TEST_POSITIONS, judgeTest, type PositionReading } from '../types/test';
+import { TEST_POSITIONS, isTestValid, judgeTest, type PositionReading, type TimekeepingTest } from '../types/test';
+import { SNAPSHOT_REASON_LABELS, SnapshotStaleError, type RepairSnapshot } from '../types/snapshot';
+import { STEP_STATE_LABELS } from '../types/step';
 import { amplitudeLevel, avgAmplitude, avgBeatError, avgRate, beatErrorLevel, rateLabel, ratePerDayToMonth } from '../utils/timeCalc';
 
 const route = useRoute();
 const router = useRouter();
 const clockStore = useClockStore();
 const stepStore = useStepStore();
+const snapshotStore = useSnapshotStore();
 
 const clockId = ref(String(route.params.clockId ?? ''));
 const clock = computed(() => clockStore.byId(clockId.value));
@@ -24,6 +28,17 @@ const readings = reactive<PositionReading[]>(
 const powerReserve = ref(42);
 const customConclusion = ref('');
 
+/** 本单绑定的快照（保存时以此版本提交） */
+const boundSnapshot = ref<RepairSnapshot | null>(null);
+/** 复测来源测试 id */
+const retestOf = ref('');
+const saving = ref(false);
+
+const currentVersion = computed(() => snapshotStore.versionOf(clockId.value));
+const boundVersion = computed(() => boundSnapshot.value?.version ?? 0);
+/** 绑定版本落后于当前版本：工序或零件已在别处变更 */
+const versionStale = computed(() => boundSnapshot.value !== null && boundVersion.value !== currentVersion.value);
+
 const avg = computed(() => ({
   rate: avgRate(readings),
   amplitude: avgAmplitude(readings),
@@ -34,11 +49,28 @@ const conclusion = computed(() =>
   customConclusion.value.trim() ? customConclusion.value.trim() : judgeTest(avg.value.rate, avg.value.beatError, avg.value.amplitude),
 );
 
+const retestSource = computed(() => stepStore.tests.find((t) => t.id === retestOf.value));
+
+function fmtTime(ts: number): string {
+  return new Date(ts).toLocaleString('zh-CN');
+}
+
 const workSheet = computed(() => {
   const lines: string[] = [];
   lines.push('走时测试单');
   lines.push(`藏品号：${clock.value?.clockNo ?? '未知'}（${clock.value?.kind ?? ''} / ${clock.value?.caliber ?? ''}）`);
   lines.push(`测试时间：${new Date().toLocaleString('zh-CN')}`);
+  if (boundSnapshot.value) {
+    const snap = boundSnapshot.value;
+    lines.push(`快照版本：v${snap.version}（${SNAPSHOT_REASON_LABELS[snap.reason]}，${fmtTime(snap.createdAt)}）`);
+    const seqText = snap.steps.map((s) => `#${s.seq} ${s.stepType}·${STEP_STATE_LABELS[s.state]}`).join(' → ');
+    lines.push(`工序序列：${seqText || '（无）'}`);
+    const partText = snap.parts.map((p) => `${p.name}·${p.decision}`).join('；');
+    lines.push(`零件处理：${partText || '（无）'}`);
+  }
+  if (retestOf.value) {
+    lines.push(`复测来源：${retestSource.value ? fmtTime(retestSource.value.testedAt) : retestOf.value} 的走时单`);
+  }
   lines.push('');
   lines.push('方位\t日差(s/d)\t摆幅(°)\t偏振(ms)');
   readings.forEach((r) => {
@@ -53,22 +85,76 @@ const workSheet = computed(() => {
   return lines.join('\n');
 });
 
+/** 绑定当前最新快照（没有则补建初始快照） */
+async function bindLatest() {
+  if (!clockId.value) return;
+  boundSnapshot.value = await snapshotStore.ensure(clockId.value);
+}
+
+async function rebind() {
+  await snapshotStore.load();
+  await bindLatest();
+  ElMessage.info(`已绑定最新快照 v${boundVersion.value}，可重新提交`);
+}
+
+/** 把某次历史测试的读数载入表单，作为复测底稿 */
+function prefillFrom(test: TimekeepingTest) {
+  retestOf.value = test.id;
+  test.positions.forEach((p) => {
+    const row = readings.find((r) => r.position === p.position);
+    if (row) {
+      row.rate = p.rate;
+      row.amplitude = p.amplitude;
+      row.beatError = p.beatError;
+    }
+  });
+  powerReserve.value = test.powerReserve;
+}
+
+function retest(row: TimekeepingTest) {
+  prefillFrom(row);
+  ElMessage.info('已载入该次读数，提交后生成可追溯的复测记录');
+}
+
 async function save() {
   if (!clockId.value) {
     ElMessage.error('未指定钟表');
     return;
   }
-  await stepStore.addTest({
-    clockId: clockId.value,
-    testedAt: Date.now(),
-    amplitude: avg.value.amplitude,
-    beatError: avg.value.beatError,
-    rate: avg.value.rate,
-    positions: readings.map((r) => ({ ...r })),
-    powerReserve: powerReserve.value,
-    conclusion: conclusion.value,
-  });
-  ElMessage.success('走时测试已记录');
+  if (!boundSnapshot.value) await bindLatest();
+  const snap = boundSnapshot.value;
+  if (!snap) return;
+  saving.value = true;
+  try {
+    await stepStore.addTest(
+      {
+        clockId: clockId.value,
+        testedAt: Date.now(),
+        amplitude: avg.value.amplitude,
+        beatError: avg.value.beatError,
+        rate: avg.value.rate,
+        positions: readings.map((r) => ({ ...r })),
+        powerReserve: powerReserve.value,
+        conclusion: conclusion.value,
+        snapshotId: snap.id,
+        snapshotVersion: snap.version,
+        retestOf: retestOf.value || undefined,
+      },
+      snap.version,
+    );
+    ElMessage.success(`走时测试已记录（绑定快照 v${snap.version}）`);
+    retestOf.value = '';
+  } catch (err) {
+    if (err instanceof SnapshotStaleError) {
+      // 版本过期：拒绝提交、保留读数，刷新本地快照状态提示重新绑定
+      await snapshotStore.load();
+      ElMessage.error(`快照已过期：工序或零件已在其他页面变更（当前 v${err.currentVersion}），本次提交被拒绝，读数已保留`);
+    } else {
+      throw err;
+    }
+  } finally {
+    saving.value = false;
+  }
 }
 
 async function copySheet() {
@@ -98,14 +184,29 @@ function reset() {
     r.beatError = 0.4;
   });
   customConclusion.value = '';
+  retestOf.value = '';
+}
+
+const isValid = (t: TimekeepingTest) => isTestValid(t, currentVersion.value);
+
+function sourceTimeOf(id: string): string {
+  const src = stepStore.tests.find((t) => t.id === id);
+  return src ? fmtTime(src.testedAt) : '旧记录';
 }
 
 onMounted(async () => {
   await clockStore.load();
   await stepStore.load();
+  await snapshotStore.load();
   if (!clock.value && clockStore.items.length > 0) {
     clockId.value = clockStore.items[0].id;
     await router.replace(`/tests/${clockId.value}`);
+  }
+  await bindLatest();
+  const retestQuery = String(route.query.retestOf ?? '');
+  if (retestQuery) {
+    const src = stepStore.tests.find((t) => t.id === retestQuery);
+    if (src) prefillFrom(src);
   }
 });
 </script>
@@ -116,9 +217,33 @@ onMounted(async () => {
       <h2>走时测试 · {{ clock?.clockNo ?? '未选择' }}</h2>
       <StateBadge :grade="clock?.conditionGrade" />
       <el-tag type="info" effect="plain">历史测试 {{ tests.length }} 次</el-tag>
+      <el-tag :type="versionStale ? 'warning' : 'success'" effect="plain">
+        当前快照 v{{ currentVersion }} · 本单绑定 v{{ boundVersion }}
+      </el-tag>
       <div class="spacer" />
       <el-button @click="router.push(`/clocks/${clockId}`)">返回钟表详情</el-button>
     </div>
+
+    <el-alert
+      v-if="versionStale"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="工序或零件已在别处变更，快照已推进"
+    >
+      <div class="stale-row">
+        <span>本单仍绑定 v{{ boundVersion }}，直接提交会被拒绝；确认变更后绑定最新快照再提交，读数会保留。</span>
+        <el-button size="small" type="warning" @click="rebind">绑定最新快照 v{{ currentVersion }}</el-button>
+      </div>
+    </el-alert>
+
+    <el-alert
+      v-if="retestOf"
+      type="info"
+      show-icon
+      :closable="false"
+      :title="`正在复测 ${retestSource ? fmtTime(retestSource.testedAt) : '旧'} 的走时单，提交后生成可追溯的新记录`"
+    />
 
     <div class="grid">
       <el-card shadow="never">
@@ -156,7 +281,7 @@ onMounted(async () => {
             <el-input v-model="customConclusion" placeholder="留空则按均值自动判定" />
           </el-form-item>
           <el-form-item>
-            <el-button type="primary" @click="save">保存测试记录</el-button>
+            <el-button type="primary" :loading="saving" @click="save">保存测试记录</el-button>
             <el-button @click="reset">重置读数</el-button>
           </el-form-item>
         </el-form>
@@ -196,13 +321,34 @@ onMounted(async () => {
           <template #header><strong>历史测试记录</strong></template>
           <el-table :data="tests" size="small" border>
             <el-table-column label="时间" width="170">
-              <template #default="{ row }">{{ new Date(row.testedAt).toLocaleString('zh-CN') }}</template>
+              <template #default="{ row }">
+                <div>{{ fmtTime(row.testedAt) }}</div>
+                <div v-if="row.retestOf" class="muted">复测自 {{ sourceTimeOf(row.retestOf) }}</div>
+              </template>
             </el-table-column>
-            <el-table-column prop="rate" label="日差" width="80" />
-            <el-table-column prop="amplitude" label="摆幅" width="80" />
-            <el-table-column prop="beatError" label="偏振" width="80" />
-            <el-table-column prop="powerReserve" label="动储 h" width="90" />
-            <el-table-column prop="conclusion" label="结论" min-width="120" />
+            <el-table-column prop="rate" label="日差" width="70" />
+            <el-table-column prop="amplitude" label="摆幅" width="70" />
+            <el-table-column prop="beatError" label="偏振" width="70" />
+            <el-table-column prop="conclusion" label="结论" min-width="100" />
+            <el-table-column label="快照" width="70">
+              <template #default="{ row }">
+                <span v-if="row.snapshotVersion !== undefined">v{{ row.snapshotVersion }}</span>
+                <span v-else>—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" width="110">
+              <template #default="{ row }">
+                <el-tag v-if="!row.snapshotId" size="small" type="info">无快照·只读</el-tag>
+                <el-tag v-else-if="isValid(row)" size="small" type="success">有效</el-tag>
+                <el-tag v-else size="small" type="danger">已失效</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="80">
+              <template #default="{ row }">
+                <el-button v-if="!isValid(row)" size="small" @click="retest(row)">复测</el-button>
+                <span v-else>—</span>
+              </template>
+            </el-table-column>
           </el-table>
           <el-empty v-if="tests.length === 0" description="暂无历史测试" :image-size="60" />
         </el-card>
@@ -228,6 +374,12 @@ onMounted(async () => {
 }
 .spacer {
   flex: 1;
+}
+.stale-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .grid {
   display: grid;

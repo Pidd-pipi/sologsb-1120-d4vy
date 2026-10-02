@@ -3,10 +3,11 @@ import type { Clock } from '../types/clock';
 import type { MovementPart } from '../types/part';
 import type { RepairStep } from '../types/step';
 import type { TimekeepingTest } from '../types/test';
+import { buildSnapshot, type RepairSnapshot } from '../types/snapshot';
 import { newId } from './id';
 
 export const DB_NAME = 'gbclockrepair';
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 export const LS_VERSION_KEY = 'gbclockrepair:db-version';
 
 class ClockRepairDB extends Dexie {
@@ -14,6 +15,7 @@ class ClockRepairDB extends Dexie {
   parts!: Table<MovementPart, string>;
   steps!: Table<RepairStep, string>;
   tests!: Table<TimekeepingTest, string>;
+  snapshots!: Table<RepairSnapshot, string>;
 
   constructor() {
     super(DB_NAME);
@@ -47,6 +49,23 @@ class ClockRepairDB extends Dexie {
           .modify((row: any) => {
             if (row.positions === undefined) row.positions = [];
           });
+      });
+    // v3：新增修复快照表，为每台钟表补初始快照；既有走时测试不补绑，保持「无快照只读」
+    this.version(3)
+      .stores({
+        clocks: 'id, clockNo, kind, caliber, conditionGrade, createdAt',
+        parts: 'id, clockId, name, wearState, decision, sourceLot',
+        steps: 'id, clockId, seq, stepType, state, startedAt',
+        tests: 'id, clockId, testedAt, conclusion',
+        snapshots: 'id, clockId, version, [clockId+version], createdAt',
+      })
+      .upgrade(async (tx) => {
+        const clocks = (await tx.table('clocks').toArray()) as Clock[];
+        const steps = (await tx.table('steps').toArray()) as RepairStep[];
+        const parts = (await tx.table('parts').toArray()) as MovementPart[];
+        const now = Date.now();
+        const rows = clocks.map((c) => buildSnapshot(c.id, 1, 'init', now, steps, parts));
+        if (rows.length > 0) await tx.table('snapshots').bulkPut(rows);
       });
   }
 }
@@ -228,13 +247,22 @@ export async function ensureSeedData(): Promise<void> {
       ],
       powerReserve: 46,
       conclusion: '合格',
+      snapshotId: `snp_${clockA}_v1`,
+      snapshotVersion: 1,
     },
   ];
 
-  await db.transaction('rw', db.clocks, db.parts, db.steps, db.tests, async () => {
+  // 初始快照：记录示范数据的步骤序列与零件处理结果，示范测试绑定 v1
+  const snapshots: RepairSnapshot[] = [
+    buildSnapshot(clockA, 1, 'init', now - 2 * day, steps, parts),
+    buildSnapshot(clockB, 1, 'init', now - 2 * day, steps, parts),
+  ];
+
+  await db.transaction('rw', db.clocks, db.parts, db.steps, db.tests, db.snapshots, async () => {
     await db.clocks.bulkPut(clocks);
     await db.parts.bulkPut(parts);
     await db.steps.bulkPut(steps);
     await db.tests.bulkPut(tests);
+    await db.snapshots.bulkPut(snapshots);
   });
 }

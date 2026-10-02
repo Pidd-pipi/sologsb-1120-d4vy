@@ -58,12 +58,12 @@ sologsb-1120/
         ├── main.ts
         ├── App.vue
         ├── router/index.ts
-        ├── types/{clock,part,step,test}.ts
-        ├── stores/{clock,part,step}Store.ts
+        ├── types/{clock,part,step,test,snapshot}.ts
+        ├── stores/{clock,part,step,snapshot}Store.ts
         ├── components/common/{StepSequence,RateChart,ClockCard,StateBadge}.vue
         ├── hooks/{useClockSearch,useRepairProgress}.ts
         ├── pages/{ClockList,ClockDetail,StepForm,PartList,TestView}.vue
-        └── utils/{db,timeCalc,id}.ts
+        └── utils/{db,timeCalc,id,crossTab}.ts
 ```
 
 ## 页面与路由
@@ -80,11 +80,23 @@ sologsb-1120/
 
 ## 数据存储说明
 
-- 数据库名 `gbclockrepair`，当前结构版本 **v2**（`localStorage['gbclockrepair:db-version']` 记录）。
-- 四张表：`clocks`（钟表）、`parts`（机芯零件）、`steps`（维修工序）、`tests`（走时测试）。
+- 数据库名 `gbclockrepair`，当前结构版本 **v3**（`localStorage['gbclockrepair:db-version']` 记录）。
+- 五张表：`clocks`（钟表）、`parts`（机芯零件）、`steps`（维修工序）、`tests`（走时测试）、`snapshots`（修复快照）。
 - v1 → v2 迁移：补齐老记录的 `state`、`partIds`、`torque`、`positions` 字段并新增索引。
+- v2 → v3 迁移：新增 `snapshots` 表，为每台已建档钟表补一份 `init` 初始快照；**既有走时测试不补绑快照，保持「无快照只读」**，不再作为完成依据。
 - 容器无状态、不挂载命名卷；清空站点数据即回到初始示范数据。
-- 首次打开灌入 2 台示范钟表、3 项零件、3 道工序与 1 次走时测试。
+- 首次打开灌入 2 台示范钟表、3 项零件、3 道工序、1 份初始快照与 1 次绑定该快照的走时测试。
+
+## 快照绑定与失效（v3）
+
+修复时常见两个标签页并行：一边回退清洗/调工序顺序，另一边还开着旧走时单。为避免台账把旧测试当成完成依据，走时测试、工序与零件决定被绑成同一份**修复快照**：
+
+- **快照内容**：每份快照记下保存时的步骤序列（顺序号 + 状态）与零件处理结果（磨损 + 决定），每台钟表版本从 1 起单调递增。
+- **测试绑定**：保存走时测试时绑定当前快照版本，走时单文本同时导出快照版本、工序序列与零件处理。
+- **失效触发**：步骤回退、顺序调整、增删工序、零件决定/磨损变化都会生成新快照，旧测试**立即失效**，台账分栏即时重算（完成步骤属正常推进，不触发失效）。
+- **并发仲裁**：两个标签页同时提交时以快照版本为准——测试保存在 IndexedDB 事务内重读当前版本，版本过期即拒绝提交并保留已录入读数，确认变更后可一键绑定最新快照再交。
+- **跨标签页同步**：任一标签页写入后通过 `BroadcastChannel` 广播，其他页面立即重载重算。
+- **旧测试只读与复测**：无快照的旧测试只读、不计入完成依据；点「复测」可把旧读数载入表单，提交后生成带 `retestOf` 溯源链的新记录，钟表详情页可查看完整快照历史。
 
 ## 功能要点
 
@@ -92,4 +104,5 @@ sologsb-1120/
 - **工序排序**：支持「上移 / 下移」按钮与原生拖拽交换顺序，交换的是 `seq`。
 - **工序完成 / 回退**：完成后写 `finishedAt`，回退后计入待办与回退计数。
 - **双轴走时图**：`<RateChart>` 左轴日差 s/d、右轴摆幅 °，标注四方位读数与均值。
-- **走时单导出**：按方位均值生成文本，可复制或下载 txt。
+- **走时单导出**：按方位均值生成文本，含快照版本、工序序列与零件处理，可复制或下载 txt。
+- **快照版本仲裁**：测试保存绑定快照版本，过期提交被拒绝并保留读数；旧测试失效后需复测生成可追溯新记录。

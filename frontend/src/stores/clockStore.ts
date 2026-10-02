@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { db, toPlain } from '../utils/db';
 import { newId } from '../utils/id';
+import { broadcastSync } from '../utils/crossTab';
 import type { Clock, ClockDraft, ConditionGrade } from '../types/clock';
 
 interface ClockState {
@@ -24,12 +25,14 @@ export const useClockStore = defineStore('clock', {
       const record: Clock = { ...toPlain(draft), id: newId('clk'), createdAt: Date.now() };
       await db.clocks.put(toPlain(record));
       this.items = [record, ...this.items];
+      broadcastSync();
       return record;
     },
     async update(id: string, patch: Partial<Clock>) {
       const plain = toPlain(patch);
       await db.clocks.update(id, plain);
       this.items = this.items.map((it) => (it.id === id ? { ...it, ...plain } : it));
+      broadcastSync();
     },
     async setGrade(id: string, grade: ConditionGrade) {
       await this.update(id, { conditionGrade: grade });
@@ -37,6 +40,7 @@ export const useClockStore = defineStore('clock', {
     async remove(id: string) {
       await db.clocks.delete(id);
       this.items = this.items.filter((it) => it.id !== id);
+      broadcastSync();
     },
   },
 });

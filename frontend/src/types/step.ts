@@ -6,6 +6,12 @@ export const STEP_TYPES: StepType[] = ['拆解', '清洗', '润滑', '装配', '
 /** 步骤状态 */
 export type StepState = 'pending' | 'done' | 'rolledback';
 
+export const STEP_STATE_LABELS: Record<StepState, string> = {
+  pending: '待办',
+  done: '已完成',
+  rolledback: '已回退',
+};
+
 /** 各步骤类型的动态字段开关 */
 export const STEP_FIELD_MAP: Record<
   StepType,

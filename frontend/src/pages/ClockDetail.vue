@@ -5,25 +5,53 @@ import { ElMessage } from 'element-plus';
 import { useClockStore } from '../stores/clockStore';
 import { usePartStore } from '../stores/partStore';
 import { useStepStore } from '../stores/stepStore';
+import { useSnapshotStore } from '../stores/snapshotStore';
 import { useRepairProgress } from '../hooks/useRepairProgress';
 import StepSequence from '../components/common/StepSequence.vue';
 import RateChart from '../components/common/RateChart.vue';
 import StateBadge from '../components/common/StateBadge.vue';
 import { CONDITION_GRADES, type ConditionGrade } from '../types/clock';
-import { judgeTest } from '../types/test';
+import { isTestValid, judgeTest, type TimekeepingTest } from '../types/test';
+import { SNAPSHOT_REASON_LABELS, type RepairSnapshot } from '../types/snapshot';
+import { STEP_STATE_LABELS } from '../types/step';
 
 const route = useRoute();
 const router = useRouter();
 const clockStore = useClockStore();
 const partStore = usePartStore();
 const stepStore = useStepStore();
+const snapshotStore = useSnapshotStore();
 
 const clockId = computed(() => String(route.params.id ?? ''));
 const clock = computed(() => clockStore.byId(clockId.value));
 const { progress, steps, done, total, percent, current, gaps } = useRepairProgress(clockId);
 const parts = computed(() => partStore.byClock(clockId.value));
 const tests = computed(() => stepStore.testsByClock(clockId.value));
+const snapshots = computed(() => snapshotStore.byClock(clockId.value));
+const currentVersion = computed(() => snapshotStore.versionOf(clockId.value));
 const activeTab = ref('steps');
+
+/** 测试有效性：无快照只读 / 已失效 / 有效 */
+function validityOf(t: TimekeepingTest): { label: string; type: 'info' | 'success' | 'danger' } {
+  if (!t.snapshotId) return { label: '无快照·只读', type: 'info' };
+  if (isTestValid(t, currentVersion.value)) return { label: `有效 · 快照 v${t.snapshotVersion}`, type: 'success' };
+  return { label: `已失效 · 快照 v${t.snapshotVersion}`, type: 'danger' };
+}
+
+function retestSourceTime(t: TimekeepingTest): string {
+  const src = stepStore.tests.find((it) => it.id === t.retestOf);
+  return src ? new Date(src.testedAt).toLocaleString('zh-CN') : '旧记录';
+}
+
+function stepSeqText(snap: RepairSnapshot): string {
+  if (snap.steps.length === 0) return '（无工序）';
+  return snap.steps.map((s) => `#${s.seq} ${s.stepType}·${STEP_STATE_LABELS[s.state]}`).join(' → ');
+}
+
+function partText(snap: RepairSnapshot): string {
+  if (snap.parts.length === 0) return '（无零件）';
+  return snap.parts.map((p) => `${p.name}·${p.decision}`).join('；');
+}
 
 async function finish(id: string) {
   await stepStore.finish(id);
@@ -31,7 +59,7 @@ async function finish(id: string) {
 }
 async function rollback(id: string) {
   await stepStore.rollback(id);
-  ElMessage.warning('步骤已回退');
+  ElMessage.warning('步骤已回退，旧走时测试已失效');
 }
 async function move(payload: { id: string; direction: 'up' | 'down' }) {
   const list = steps.value;
@@ -39,11 +67,11 @@ async function move(payload: { id: string; direction: 'up' | 'down' }) {
   const target = payload.direction === 'up' ? list[index - 1] : list[index + 1];
   if (!target) return;
   await stepStore.swapSeq(payload.id, target.id);
-  ElMessage.success('顺序已调整');
+  ElMessage.success('顺序已调整，旧走时测试已失效');
 }
 async function reorder(payload: { fromId: string; toId: string }) {
   await stepStore.swapSeq(payload.fromId, payload.toId);
-  ElMessage.success('已按拖拽交换顺序');
+  ElMessage.success('已按拖拽交换顺序，旧走时测试已失效');
 }
 async function changeGrade(value: unknown) {
   const grade = String(value) as ConditionGrade;
@@ -55,6 +83,7 @@ onMounted(async () => {
   await clockStore.load();
   await partStore.load();
   await stepStore.load();
+  await snapshotStore.load();
 });
 </script>
 
@@ -63,6 +92,7 @@ onMounted(async () => {
     <div class="header">
       <h2>钟表详情 · {{ clock?.clockNo ?? '未找到' }}</h2>
       <StateBadge v-if="clock" :grade="clock.conditionGrade" />
+      <el-tag type="info" effect="plain">快照 v{{ currentVersion }}</el-tag>
       <el-tag v-if="gaps.length" type="danger">顺序号缺口：{{ gaps.join('、') }}</el-tag>
       <el-tag v-else type="success" effect="plain">顺序号连续</el-tag>
       <div class="spacer" />
@@ -137,11 +167,41 @@ onMounted(async () => {
                 <div class="card-head">
                   <strong>{{ new Date(t.testedAt).toLocaleString('zh-CN') }}</strong>
                   <el-tag size="small" type="success">{{ t.conclusion || judgeTest(t.rate, t.beatError, t.amplitude) }}</el-tag>
+                  <el-tag size="small" :type="validityOf(t).type">{{ validityOf(t).label }}</el-tag>
                   <span class="muted">日差 {{ t.rate }} s/d · 摆幅 {{ t.amplitude }}° · 偏振 {{ t.beatError }} ms</span>
+                  <div class="spacer" />
+                  <el-button
+                    v-if="!isTestValid(t, currentVersion)"
+                    size="small"
+                    @click="router.push(`/tests/${clockId}?retestOf=${t.id}`)"
+                  >
+                    复测
+                  </el-button>
                 </div>
+                <div v-if="t.retestOf" class="muted retest-line">复测自 {{ retestSourceTime(t) }} 的走时单</div>
                 <RateChart :readings="t.positions" />
               </div>
               <el-empty v-if="tests.length === 0" description="暂无走时测试记录" :image-size="60" />
+            </el-tab-pane>
+            <el-tab-pane :label="`快照记录（${snapshots.length}）`" name="snapshots">
+              <el-table :data="snapshots" size="small" border>
+                <el-table-column label="版本" width="70">
+                  <template #default="{ row }">v{{ row.version }}</template>
+                </el-table-column>
+                <el-table-column label="时间" width="170">
+                  <template #default="{ row }">{{ new Date(row.createdAt).toLocaleString('zh-CN') }}</template>
+                </el-table-column>
+                <el-table-column label="触发原因" width="120">
+                  <template #default="{ row }">{{ SNAPSHOT_REASON_LABELS[row.reason as keyof typeof SNAPSHOT_REASON_LABELS] }}</template>
+                </el-table-column>
+                <el-table-column label="步骤序列" min-width="260">
+                  <template #default="{ row }">{{ stepSeqText(row) }}</template>
+                </el-table-column>
+                <el-table-column label="零件处理" min-width="180">
+                  <template #default="{ row }">{{ partText(row) }}</template>
+                </el-table-column>
+              </el-table>
+              <el-empty v-if="snapshots.length === 0" description="暂无快照记录" :image-size="60" />
             </el-tab-pane>
           </el-tabs>
         </el-card>
@@ -195,5 +255,8 @@ onMounted(async () => {
 }
 .test-block {
   margin-bottom: 16px;
+}
+.retest-line {
+  margin: 4px 0;
 }
 </style>

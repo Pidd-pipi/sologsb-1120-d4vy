@@ -29,9 +29,20 @@ export interface TimekeepingTest {
   /** 动力储备 h */
   powerReserve: number;
   conclusion: string;
+  /** 绑定的快照 id；旧记录无快照则为空，只读、不作完成依据 */
+  snapshotId?: string;
+  /** 绑定的快照版本 */
+  snapshotVersion?: number;
+  /** 复测来源测试 id（可追溯） */
+  retestOf?: string;
 }
 
 export type TimekeepingTestDraft = Omit<TimekeepingTest, 'id'>;
+
+/** 测试是否有效：绑定的快照版本与当前版本一致；无快照的旧测试一律无效（只读） */
+export function isTestValid(test: TimekeepingTest, currentVersion: number): boolean {
+  return test.snapshotVersion !== undefined && currentVersion > 0 && test.snapshotVersion === currentVersion;
+}
 
 /** 走时合格判定 */
 export function judgeTest(rate: number, beatError: number, amplitude: number): string {
