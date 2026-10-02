@@ -84,11 +84,11 @@ async function submit() {
 
 async function finish(id: string) {
   await stepStore.finish(id);
-  ElMessage.success('步骤已完成');
+  ElMessage.success('步骤已完成，已有走时测试若基于旧快照将立即失效');
 }
 async function rollback(id: string) {
   await stepStore.rollback(id);
-  ElMessage.warning('步骤已回退');
+  ElMessage.warning('步骤已回退，基于该快照的走时测试已失效，请复测');
 }
 
 onMounted(async () => {

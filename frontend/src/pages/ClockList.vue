@@ -3,13 +3,16 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useClockStore } from '../stores/clockStore';
+import { usePartStore } from '../stores/partStore';
 import { useStepStore } from '../stores/stepStore';
 import { useClockSearch } from '../hooks/useClockSearch';
 import ClockCard from '../components/common/ClockCard.vue';
 import { CLOCK_KINDS, CONDITION_GRADES, type ClockDraft, type ClockKind, type ConditionGrade } from '../types/clock';
+import { evaluateTest, partsOf, repairStateOf as repairStateOfClock, stepsOf } from '../utils/snapshot';
 
 const router = useRouter();
 const clockStore = useClockStore();
+const partStore = usePartStore();
 const stepStore = useStepStore();
 const { filters, result, options, reset } = useClockSearch();
 
@@ -17,16 +20,22 @@ const REPAIR_STATES = ['未开工', '维修中', '待测试', '已完成'] as co
 
 type RepairState = (typeof REPAIR_STATES)[number];
 
-/** 由工序与走时测试推导修复状态，用于台账分栏 */
+/**
+ * 由工序与走时测试推导修复状态，用于台账分栏。
+ * 只有绑定了有效快照的测试才把状态推到「已完成」；
+ * 工序回退 / 顺序调整 / 零件决定变化后旧测试失效，状态立即重算。
+ */
 function repairStateOf(clockId: string): RepairState {
-  const steps = stepStore.items.filter((s) => s.clockId === clockId);
-  const tests = stepStore.tests.filter((t) => t.clockId === clockId);
-  const done = steps.filter((s) => s.state === 'done').length;
-  if (steps.length === 0) return '未开工';
-  if (done === steps.length && tests.length > 0) return '已完成';
-  if (done === steps.length) return '待测试';
-  if (done > 0) return '维修中';
-  return '未开工';
+  return repairStateOfClock(clockId, stepStore.items, partStore.items, stepStore.tests);
+}
+
+/** 某钟表的有效走时测试数（可作为完成依据） */
+function effectiveTestCount(clockId: string): number {
+  const cs = stepsOf(stepStore.items, clockId);
+  const cp = partsOf(partStore.items, clockId);
+  return stepStore.tests.filter(
+    (t) => t.clockId === clockId && evaluateTest(t, cs, cp).status === 'valid',
+  ).length;
 }
 
 const columns = computed(() =>
@@ -78,6 +87,7 @@ async function submit() {
 
 onMounted(() => {
   void clockStore.load();
+  void partStore.load();
   void stepStore.load();
 });
 </script>
@@ -145,7 +155,7 @@ onMounted(() => {
           :item="item"
           :footer="`工序 ${stepStore.items.filter((s) => s.clockId === item.id && s.state === 'done').length}/${
             stepStore.items.filter((s) => s.clockId === item.id).length
-          } · 走时测试 ${stepStore.tests.filter((t) => t.clockId === item.id).length} 次`"
+          } · 有效走时测试 ${effectiveTestCount(item.id)} 次`"
           @open="(id) => router.push(`/clocks/${id}`)"
         />
         <el-empty v-if="col.rows.length === 0" description="暂无" :image-size="60" />

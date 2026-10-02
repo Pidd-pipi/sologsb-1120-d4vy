@@ -1,8 +1,19 @@
 import { defineStore } from 'pinia';
 import { db, toPlain } from '../utils/db';
 import { newId } from '../utils/id';
+import {
+  buildPartSnapshots,
+  buildStepSnapshots,
+  computeSnapshotVersion,
+} from '../utils/snapshot';
+import type { MovementPart } from '../types/part';
 import type { RepairStep, RepairStepDraft } from '../types/step';
 import type { TimekeepingTest, TimekeepingTestDraft } from '../types/test';
+
+/** 提交走时测试的结果：ok 为已落库；stale 为快照版本过期、读数保留 */
+export type AddTestResult =
+  | { ok: true; test: TimekeepingTest }
+  | { ok: false; reason: 'stale'; currentVersion: string; baseVersion: string };
 
 interface StepState {
   items: RepairStep[];
@@ -57,11 +68,35 @@ export const useStepStore = defineStore('step', {
         return it;
       });
     },
-    async addTest(draft: TimekeepingTestDraft) {
-      const record: TimekeepingTest = { ...toPlain(draft), id: newId('tst') };
+    /**
+     * 保存走时测试并绑定工序 / 零件快照。
+     *
+     * 乐观并发：baseVersion 是录入开始时的快照版本；提交时从 IndexedDB
+     * 重读该钟表最新工序与零件数据派生 currentVersion。两者不一致
+     * （另一标签页回退了工序、调了顺序或改了零件决定）则拒绝提交，
+     * 调用方保留读数，提示版本过期。
+     */
+    async addTest(draft: TimekeepingTestDraft, baseVersion: string): Promise<AddTestResult> {
+      const clockId = draft.clockId;
+      // 直接读库，拿到其他标签页已落库的最新状态（Pinia 内存态不会跨标签页同步）
+      const [freshSteps, freshParts] = await Promise.all([
+        db.steps.where('clockId').equals(clockId).toArray(),
+        db.parts.where('clockId').equals(clockId).toArray(),
+      ]);
+      const currentVersion = computeSnapshotVersion(freshSteps, freshParts);
+      if (baseVersion !== currentVersion) {
+        return { ok: false, reason: 'stale', currentVersion, baseVersion };
+      }
+      const record: TimekeepingTest = {
+        ...toPlain(draft),
+        id: newId('tst'),
+        snapshotVersion: currentVersion,
+        steps: buildStepSnapshots(freshSteps),
+        parts: buildPartSnapshots(freshParts),
+      };
       await db.tests.put(toPlain(record));
       this.tests = [record, ...this.tests];
-      return record;
+      return { ok: true, test: record };
     },
     async removeTest(id: string) {
       await db.tests.delete(id);
@@ -69,3 +104,14 @@ export const useStepStore = defineStore('step', {
     },
   },
 });
+
+/** 从 IndexedDB 重读某钟表的最新工序与零件（供界面刷新快照状态） */
+export async function loadClockSnapshotData(
+  clockId: string,
+): Promise<{ steps: RepairStep[]; parts: MovementPart[] }> {
+  const [steps, parts] = await Promise.all([
+    db.steps.where('clockId').equals(clockId).toArray(),
+    db.parts.where('clockId').equals(clockId).toArray(),
+  ]);
+  return { steps, parts };
+}

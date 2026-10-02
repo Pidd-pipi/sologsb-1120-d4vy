@@ -83,7 +83,7 @@ async function submit() {
 
 async function setDecision(id: string, decision: PartDecision) {
   await partStore.update(id, { decision });
-  ElMessage.success(`处理决定已改为「${decision}」`);
+  ElMessage.success(`处理决定已改为「${decision}」，基于旧快照的走时测试已失效，请复测`);
 }
 
 onMounted(async () => {

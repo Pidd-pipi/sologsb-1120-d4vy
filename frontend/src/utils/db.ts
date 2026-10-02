@@ -6,7 +6,7 @@ import type { TimekeepingTest } from '../types/test';
 import { newId } from './id';
 
 export const DB_NAME = 'gbclockrepair';
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 export const LS_VERSION_KEY = 'gbclockrepair:db-version';
 
 class ClockRepairDB extends Dexie {
@@ -47,6 +47,16 @@ class ClockRepairDB extends Dexie {
           .modify((row: any) => {
             if (row.positions === undefined) row.positions = [];
           });
+      });
+    // v3：走时测试绑定工序 / 零件快照。
+    // 旧版测试没有 snapshotVersion/steps/parts 字段，保持原样 ——
+    // 运行时按「无快照只读」处理，复测后生成带快照的新结果。
+    this.version(3)
+      .stores({
+        tests: 'id, clockId, testedAt, conclusion, snapshotVersion',
+      })
+      .upgrade(async () => {
+        /* 旧测试无快照字段即视为 legacy 只读，无需搬数据 */
       });
   }
 }

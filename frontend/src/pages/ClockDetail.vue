@@ -11,6 +11,7 @@ import RateChart from '../components/common/RateChart.vue';
 import StateBadge from '../components/common/StateBadge.vue';
 import { CONDITION_GRADES, type ConditionGrade } from '../types/clock';
 import { judgeTest } from '../types/test';
+import { computeSnapshotVersion, evaluateTest, partsOf, stepsOf } from '../utils/snapshot';
 
 const route = useRoute();
 const router = useRouter();
@@ -25,13 +26,28 @@ const parts = computed(() => partStore.byClock(clockId.value));
 const tests = computed(() => stepStore.testsByClock(clockId.value));
 const activeTab = ref('steps');
 
+/** 当前工序 / 零件派生的快照版本（测试保存时绑定的基准） */
+const currentVersion = computed(() =>
+  computeSnapshotVersion(stepsOf(stepStore.items, clockId.value), partsOf(partStore.items, clockId.value)),
+);
+
+/** 逐条测试的快照有效性 */
+const testsWithValidity = computed(() =>
+  tests.value.map((t) => ({
+    ...t,
+    validity: evaluateTest(t, stepsOf(stepStore.items, clockId.value), partsOf(partStore.items, clockId.value)),
+  })),
+);
+const legacyCount = computed(() => testsWithValidity.value.filter((t) => t.validity.status === 'legacy').length);
+const staleCount = computed(() => testsWithValidity.value.filter((t) => t.validity.status === 'stale').length);
+
 async function finish(id: string) {
   await stepStore.finish(id);
-  ElMessage.success('步骤已完成');
+  ElMessage.success('步骤已完成，已有走时测试若基于旧快照将立即失效');
 }
 async function rollback(id: string) {
   await stepStore.rollback(id);
-  ElMessage.warning('步骤已回退');
+  ElMessage.warning('步骤已回退，基于该快照的走时测试已失效，请复测');
 }
 async function move(payload: { id: string; direction: 'up' | 'down' }) {
   const list = steps.value;
@@ -39,11 +55,11 @@ async function move(payload: { id: string; direction: 'up' | 'down' }) {
   const target = payload.direction === 'up' ? list[index - 1] : list[index + 1];
   if (!target) return;
   await stepStore.swapSeq(payload.id, target.id);
-  ElMessage.success('顺序已调整');
+  ElMessage.success('顺序已调整，旧快照测试已失效');
 }
 async function reorder(payload: { fromId: string; toId: string }) {
   await stepStore.swapSeq(payload.fromId, payload.toId);
-  ElMessage.success('已按拖拽交换顺序');
+  ElMessage.success('已按拖拽交换顺序，旧快照测试已失效');
 }
 async function changeGrade(value: unknown) {
   const grade = String(value) as ConditionGrade;
@@ -65,6 +81,7 @@ onMounted(async () => {
       <StateBadge v-if="clock" :grade="clock.conditionGrade" />
       <el-tag v-if="gaps.length" type="danger">顺序号缺口：{{ gaps.join('、') }}</el-tag>
       <el-tag v-else type="success" effect="plain">顺序号连续</el-tag>
+      <el-tag type="info" effect="plain">当前快照 {{ currentVersion }}</el-tag>
       <div class="spacer" />
       <el-button type="primary" @click="router.push(`/steps/new?clockId=${clockId}`)">追加维修工序</el-button>
       <el-button @click="router.push(`/tests/${clockId}`)">走时测试录入</el-button>
@@ -133,11 +150,40 @@ onMounted(async () => {
               <el-empty v-if="parts.length === 0" description="暂无零件登记" :image-size="60" />
             </el-tab-pane>
             <el-tab-pane :label="`走时测试（${tests.length}）`" name="tests">
-              <div v-for="t in tests" :key="t.id" class="test-block">
+              <el-alert
+                v-if="legacyCount > 0"
+                type="info"
+                :closable="false"
+                show-icon
+                class="test-alert"
+                :title="`${legacyCount} 条旧版走时单无快照，只读、不计入完成状态`"
+                description="复测后新测试会绑定工序序列与零件处理结果，生成可追溯快照。"
+              />
+              <el-alert
+                v-if="staleCount > 0"
+                type="warning"
+                :closable="false"
+                show-icon
+                class="test-alert"
+                :title="`${staleCount} 条测试快照已过期，不计入完成状态`"
+                description="工序回退、顺序调整或零件处理决定变化都会使旧测试失效，请复测。"
+              />
+              <div v-for="t in testsWithValidity" :key="t.id" class="test-block">
                 <div class="card-head">
                   <strong>{{ new Date(t.testedAt).toLocaleString('zh-CN') }}</strong>
                   <el-tag size="small" type="success">{{ t.conclusion || judgeTest(t.rate, t.beatError, t.amplitude) }}</el-tag>
+                  <el-tag v-if="t.validity.status === 'valid'" size="small" type="success" effect="plain">
+                    有效 {{ t.snapshotVersion }}
+                  </el-tag>
+                  <el-tag v-else-if="t.validity.status === 'stale'" size="small" type="danger" effect="plain">已失效</el-tag>
+                  <el-tag v-else size="small" type="info" effect="plain">旧版 · 只读</el-tag>
                   <span class="muted">日差 {{ t.rate }} s/d · 摆幅 {{ t.amplitude }}° · 偏振 {{ t.beatError }} ms</span>
+                  <span class="muted">
+                    绑定工序 {{ t.steps?.length ?? 0 }} 道 · 零件 {{ t.parts?.length ?? 0 }} 项
+                  </span>
+                </div>
+                <div v-if="t.validity.status === 'stale'" class="stale-reasons">
+                  <span v-for="(r, i) in t.validity.reasons" :key="i" class="reason">· {{ r }}</span>
                 </div>
                 <RateChart :readings="t.positions" />
               </div>
@@ -195,5 +241,19 @@ onMounted(async () => {
 }
 .test-block {
   margin-bottom: 16px;
+}
+.test-alert {
+  margin-bottom: 10px;
+}
+.stale-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 2px 0 6px;
+}
+.reason {
+  color: #b04a3a;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

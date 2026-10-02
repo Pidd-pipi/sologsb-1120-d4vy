@@ -1,22 +1,36 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useClockStore } from '../stores/clockStore';
-import { useStepStore } from '../stores/stepStore';
+import { usePartStore } from '../stores/partStore';
+import { loadClockSnapshotData, useStepStore } from '../stores/stepStore';
 import RateChart from '../components/common/RateChart.vue';
 import StateBadge from '../components/common/StateBadge.vue';
 import { TEST_POSITIONS, judgeTest, type PositionReading } from '../types/test';
 import { amplitudeLevel, avgAmplitude, avgBeatError, avgRate, beatErrorLevel, rateLabel, ratePerDayToMonth } from '../utils/timeCalc';
+import { computeSnapshotVersion, evaluateTest, partsOf, stepsOf } from '../utils/snapshot';
 
 const route = useRoute();
 const router = useRouter();
 const clockStore = useClockStore();
+const partStore = usePartStore();
 const stepStore = useStepStore();
 
 const clockId = ref(String(route.params.clockId ?? ''));
 const clock = computed(() => clockStore.byId(clockId.value));
 const tests = computed(() => stepStore.testsByClock(clockId.value));
+
+/** 当前钟表的工序序列与零件处理结果（用于快照版本派生与有效性判定） */
+const steps = computed(() => stepsOf(stepStore.items, clockId.value));
+const parts = computed(() => partsOf(partStore.items, clockId.value));
+const currentVersion = computed(() => computeSnapshotVersion(steps.value, parts.value));
+
+/** 录入开始时记录的快照版本（乐观并发基准） */
+const baseVersion = ref('');
+/** 检测到工序 / 零件已在其他标签页变动 */
+const versionStale = ref(false);
+const saving = ref(false);
 
 const readings = reactive<PositionReading[]>(
   TEST_POSITIONS.map((position) => ({ position, rate: 0, amplitude: 260, beatError: 0.4 })),
@@ -53,22 +67,60 @@ const workSheet = computed(() => {
   return lines.join('\n');
 });
 
+/** 历史测试逐条判定有效性 */
+const testsWithValidity = computed(() =>
+  tests.value.map((t) => ({ ...t, validity: evaluateTest(t, steps.value, parts.value) })),
+);
+const effectiveCount = computed(
+  () => testsWithValidity.value.filter((t) => t.validity.status === 'valid').length,
+);
+const staleCount = computed(() => testsWithValidity.value.filter((t) => t.validity.status === 'stale').length);
+const legacyCount = computed(() => testsWithValidity.value.filter((t) => t.validity.status === 'legacy').length);
+
+/** 从 store 重算快照基准（本标签页内工序 / 零件变动后调用） */
+function recalcBaseVersion() {
+  baseVersion.value = computeSnapshotVersion(steps.value, parts.value);
+}
+
+/** 刷新快照状态：重载数据并重算基准，已填读数保留 */
+async function refreshSnapshot() {
+  await Promise.all([stepStore.load(), partStore.load()]);
+  recalcBaseVersion();
+  versionStale.value = false;
+  ElMessage.success('已同步最新工序 / 零件状态，读数保留');
+}
+
 async function save() {
   if (!clockId.value) {
     ElMessage.error('未指定钟表');
     return;
   }
-  await stepStore.addTest({
-    clockId: clockId.value,
-    testedAt: Date.now(),
-    amplitude: avg.value.amplitude,
-    beatError: avg.value.beatError,
-    rate: avg.value.rate,
-    positions: readings.map((r) => ({ ...r })),
-    powerReserve: powerReserve.value,
-    conclusion: conclusion.value,
-  });
-  ElMessage.success('走时测试已记录');
+  saving.value = true;
+  try {
+    const result = await stepStore.addTest(
+      {
+        clockId: clockId.value,
+        testedAt: Date.now(),
+        amplitude: avg.value.amplitude,
+        beatError: avg.value.beatError,
+        rate: avg.value.rate,
+        positions: readings.map((r) => ({ ...r })),
+        powerReserve: powerReserve.value,
+        conclusion: conclusion.value,
+      },
+      baseVersion.value,
+    );
+    if (!result.ok) {
+      // 乐观并发冲突：版本过期，拒绝提交，读数原样保留
+      versionStale.value = true;
+      ElMessage.error(`提交已拒绝：快照版本过期（${result.baseVersion} → ${result.currentVersion}），读数已保留`);
+      return;
+    }
+    versionStale.value = false;
+    ElMessage.success(`走时测试已记录，已绑定工序快照 ${result.test.snapshotVersion}`);
+  } finally {
+    saving.value = false;
+  }
 }
 
 async function copySheet() {
@@ -100,14 +152,25 @@ function reset() {
   customConclusion.value = '';
 }
 
+/** 标签页重新可见时，检测其他标签页是否已改动工序 / 零件 */
+async function onVisible() {
+  if (document.visibilityState !== 'visible' || !clockId.value) return;
+  const { steps: freshSteps, parts: freshParts } = await loadClockSnapshotData(clockId.value);
+  const freshVersion = computeSnapshotVersion(freshSteps, freshParts);
+  versionStale.value = freshVersion !== baseVersion.value;
+}
+
 onMounted(async () => {
-  await clockStore.load();
-  await stepStore.load();
+  await Promise.all([clockStore.load(), partStore.load(), stepStore.load()]);
   if (!clock.value && clockStore.items.length > 0) {
     clockId.value = clockStore.items[0].id;
     await router.replace(`/tests/${clockId.value}`);
   }
+  recalcBaseVersion();
+  document.addEventListener('visibilitychange', onVisible);
 });
+
+onUnmounted(() => document.removeEventListener('visibilitychange', onVisible));
 </script>
 
 <template>
@@ -116,13 +179,38 @@ onMounted(async () => {
       <h2>走时测试 · {{ clock?.clockNo ?? '未选择' }}</h2>
       <StateBadge :grade="clock?.conditionGrade" />
       <el-tag type="info" effect="plain">历史测试 {{ tests.length }} 次</el-tag>
+      <el-tag v-if="effectiveCount" type="success" effect="plain">有效 {{ effectiveCount }}</el-tag>
+      <el-tag v-if="staleCount" type="danger" effect="plain">已失效 {{ staleCount }}</el-tag>
+      <el-tag v-if="legacyCount" type="warning" effect="plain">旧版只读 {{ legacyCount }}</el-tag>
       <div class="spacer" />
       <el-button @click="router.push(`/clocks/${clockId}`)">返回钟表详情</el-button>
     </div>
 
+    <el-alert
+      v-if="versionStale"
+      type="error"
+      :closable="false"
+      show-icon
+      class="stale-alert"
+      title="快照版本过期：检测到工序回退 / 顺序调整或零件处理决定已变化，本次提交将被拒绝"
+      description="已填读数会原样保留。请先同步最新工序 / 零件状态，再重新提交复测。"
+    >
+      <div class="stale-actions">
+        <el-button size="small" type="primary" @click="refreshSnapshot">刷新快照状态（读数保留）</el-button>
+        <span class="muted">录入时版本 {{ baseVersion }} → 当前版本 {{ currentVersion }}</span>
+      </div>
+    </el-alert>
+
     <div class="grid">
       <el-card shadow="never">
-        <template #header><strong>多方位读数录入</strong></template>
+        <template #header>
+          <div class="card-head">
+            <strong>多方位读数录入</strong>
+            <el-tag size="small" type="info" effect="plain">
+              绑定快照 {{ baseVersion || '—' }} · 工序 {{ steps.length }} 道 · 零件 {{ parts.length }} 项
+            </el-tag>
+          </div>
+        </template>
         <el-table :data="readings" size="small" border>
           <el-table-column prop="position" label="方位" width="90" />
           <el-table-column label="日差 s/d" width="150">
@@ -156,8 +244,9 @@ onMounted(async () => {
             <el-input v-model="customConclusion" placeholder="留空则按均值自动判定" />
           </el-form-item>
           <el-form-item>
-            <el-button type="primary" @click="save">保存测试记录</el-button>
+            <el-button type="primary" :loading="saving" @click="save">保存测试记录</el-button>
             <el-button @click="reset">重置读数</el-button>
+            <el-button @click="refreshSnapshot">刷新快照状态</el-button>
           </el-form-item>
         </el-form>
       </el-card>
@@ -194,7 +283,25 @@ onMounted(async () => {
 
         <el-card shadow="never">
           <template #header><strong>历史测试记录</strong></template>
-          <el-table :data="tests" size="small" border>
+          <el-alert
+            v-if="legacyCount > 0"
+            type="info"
+            :closable="false"
+            show-icon
+            class="history-alert"
+            :title="`${legacyCount} 条旧版走时单无快照，仅作只读参考，不计入完成状态`"
+            description="请重新复测并保存，新测试会绑定工序序列与零件处理结果，生成可追溯的快照。"
+          />
+          <el-alert
+            v-if="staleCount > 0"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="history-alert"
+            :title="`${staleCount} 条测试快照已过期（工序回退 / 顺序调整或零件决定变化），不计入完成状态`"
+            description="请刷新快照状态后复测，以最新工序 / 零件结果重新判定。"
+          />
+          <el-table :data="testsWithValidity" size="small" border>
             <el-table-column label="时间" width="170">
               <template #default="{ row }">{{ new Date(row.testedAt).toLocaleString('zh-CN') }}</template>
             </el-table-column>
@@ -202,9 +309,21 @@ onMounted(async () => {
             <el-table-column prop="amplitude" label="摆幅" width="80" />
             <el-table-column prop="beatError" label="偏振" width="80" />
             <el-table-column prop="powerReserve" label="动储 h" width="90" />
-            <el-table-column prop="conclusion" label="结论" min-width="120" />
+            <el-table-column prop="conclusion" label="结论" min-width="110" />
+            <el-table-column label="快照状态" min-width="180">
+              <template #default="{ row }">
+                <el-tag v-if="row.validity.status === 'valid'" size="small" type="success">
+                  有效 {{ row.snapshotVersion }}
+                </el-tag>
+                <div v-else-if="row.validity.status === 'stale'">
+                  <el-tag size="small" type="danger">已失效</el-tag>
+                  <div v-for="(r, i) in row.validity.reasons" :key="i" class="reason">· {{ r }}</div>
+                </div>
+                <el-tag v-else size="small" type="info">旧版 · 只读</el-tag>
+              </template>
+            </el-table-column>
           </el-table>
-          <el-empty v-if="tests.length === 0" description="暂无历史测试" :image-size="60" />
+          <el-empty v-if="tests.length === 0" description="暂无历史测试，请复测生成可追溯结果" :image-size="60" />
         </el-card>
       </div>
     </div>
@@ -228,6 +347,15 @@ onMounted(async () => {
 }
 .spacer {
   flex: 1;
+}
+.stale-alert {
+  margin: 0;
+}
+.stale-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
 }
 .grid {
   display: grid;
@@ -259,5 +387,15 @@ onMounted(async () => {
 .card-head {
   display: flex;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.history-alert {
+  margin-bottom: 10px;
+}
+.reason {
+  color: #b04a3a;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>
